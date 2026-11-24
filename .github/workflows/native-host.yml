@@ -1,0 +1,201 @@
+name: Rebuild BCD 712 native host
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_run_id:
+        description: "Active LLVM warmup run ID on this branch, or leave empty for a populated cache"
+        required: false
+        type: string
+      fex_run_id:
+        description: "Active FEX warmup run ID on this branch, or leave empty for a populated cache"
+        required: false
+        type: string
+      build_cold:
+        description: "Build missing FEX/LLVM dependencies locally in this run"
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: native-host-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  warmups:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        dependency: [fex, llvm]
+    steps:
+      - name: Wait for the requested upstream cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEP: ${{ matrix.dependency }}
+          FEX_RUN_ID: ${{ inputs.fex_run_id }}
+          LLVM_RUN_ID: ${{ inputs.llvm_run_id }}
+        run: |
+          set -euo pipefail
+          case "$DEP" in fex) id="$FEX_RUN_ID";; llvm) id="$LLVM_RUN_ID";; esac
+          [ -n "$id" ] || exit 0
+          [[ "$id" =~ ^[0-9]+$ ]] || { echo "Expected numeric run ID"; exit 1; }
+          while :; do
+            reply="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id")"
+            jq -e --arg path ".github/workflows/$DEP.yml" --arg branch "$GITHUB_REF_NAME" '.path == $path and .head_branch == $branch' <<< "$reply" > /dev/null
+            if [ "$(jq -r .status <<< "$reply")" = completed ]; then
+              jq -e '.conclusion == "success"' <<< "$reply" > /dev/null
+              break
+            fi
+            sleep 40
+          done
+  wine:
+    runs-on: macos-15
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [wine]
+    steps: &native_component_steps
+      - uses: actions/checkout@v4
+        with:
+          path: recipes
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: thebcd69/bcd-games
+          ref: f811dd05a9183cda20ffd3956cb1958cafe654f7
+          path: publisher
+          persist-credentials: false
+      - name: Select and fingerprint Xcode
+        id: xcode
+        run: bash recipes/ci/native_xcode.sh
+      - name: Restore previously verified component
+        id: built
+        uses: actions/cache/restore@v4
+        with:
+          key: native-v712-${{ matrix.component }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('recipes/ci/native*','recipes/.github/workflows/native-host.yml') }}-${{ matrix.component == 'wine' && hashFiles('recipes/patches/stray-va-cursor.patch') || 'stock' }}
+          path: transfer/${{ matrix.component }}.tar.gz
+      - name: Stage pinned release sources
+        if: steps.built.outputs.cache-hit != 'true'
+        run: python3 recipes/ci/native_host.py prepare
+      - name: Restore prebuilt FEX dependencies
+        if: matrix.component == 'fex' && steps.built.outputs.cache-hit != 'true'
+        id: fex
+        uses: actions/cache/restore@v4
+        with:
+          key: bcd-v712-fex-static-arm64-ios17-v1
+          path: bcd/FEX/build-ios
+      - name: Restore prebuilt LLVM for iOS
+        if: matrix.component == 'graphics' && steps.built.outputs.cache-hit != 'true'
+        id: llvm
+        uses: actions/cache/restore@v4
+        with:
+          key: bcd-v712-llvm15-8dfdcc7b-ios17-arm64-macos15-v1
+          path: .stray-cache/llvm-15-ios17-arm64
+      - name: Build selected native component
+        if: steps.built.outputs.cache-hit != 'true'
+        env:
+          COMPONENT: ${{ matrix.component }}
+          FEX_HIT: ${{ steps.fex.outputs.cache-hit }}
+          LLVM_HIT: ${{ steps.llvm.outputs.cache-hit }}
+          BUILD_COLD: ${{ inputs.build_cold }}
+        run: |
+          set -eu
+          case "$COMPONENT" in
+            wine)
+              brew install bison llvm lld
+              export PATH="$(brew --prefix bison)/bin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+              python3 recipes/ci/native_host.py run wine ;;
+            graphics)
+              brew install ninja
+              if [ "$LLVM_HIT" != true ]; then
+                [ "$BUILD_COLD" = true ] || { echo 'LLVM cache missing; run llvm.yml or explicitly request a cold build'; exit 1; }
+                bash recipes/scripts/build-llvm.sh build
+              fi
+              bash recipes/scripts/build-llvm.sh verify
+              mkdir -p bcd/toolchains
+              mv .stray-cache/llvm-15-ios17-arm64/toolchains/* bcd/toolchains/
+              if ! xcrun -sdk macosx metal --version > /dev/null 2>&1; then
+                xcodebuild -downloadComponent MetalToolchain
+              fi
+              xcrun -sdk macosx metal --version
+              python3 recipes/ci/native_host.py run graphics ;;
+            fex)
+              if [ "$FEX_HIT" != true ]; then
+                [ "$BUILD_COLD" = true ] || { echo 'FEX cache missing; run fex.yml or explicitly request a cold build'; exit 1; }
+                brew install ninja
+                bash recipes/scripts/build-fex.sh build
+              fi
+              bash recipes/scripts/build-fex.sh verify ;;
+          esac
+          python3 recipes/ci/native_host.py pack "$COMPONENT"
+      - name: Cache successful component
+        if: steps.built.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ steps.built.outputs.cache-primary-key }}
+          path: transfer/${{ matrix.component }}.tar.gz
+      - name: Transfer native dependencies
+        uses: actions/upload-artifact@v4
+        with:
+          name: component-${{ matrix.component }}
+          path: transfer/${{ matrix.component }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+      - name: Show compiler errors
+        if: failure()
+        run: |
+          find bcd -maxdepth 1 -name '*.log' -print -exec tail -n 35 {} \;
+          df -h .
+
+  graphics-and-fex:
+    needs: warmups
+    runs-on: macos-15
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [graphics, fex]
+    steps: *native_component_steps
+
+  link:
+    needs: [wine, graphics-and-fex]
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: recipes
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: thebcd69/bcd-games
+          ref: f811dd05a9183cda20ffd3956cb1958cafe654f7
+          path: publisher
+          persist-credentials: false
+      - name: Select Xcode
+        run: bash recipes/ci/native_xcode.sh
+      - name: Stage pinned release sources
+        run: python3 recipes/ci/native_host.py prepare
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: component-*
+          merge-multiple: true
+          path: transfer
+      - name: Link and verify native host against official v712
+        run: python3 recipes/ci/native_host.py link
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BCD-v712-Stray-native-host
+          path: |
+            out/Madeira
+            out/build.json
+          if-no-files-found: error
+          retention-days: 5
+      - name: Show archive failures
+        if: failure()
+        run: test ! -f bcd/archive.log || tail -n 45 bcd/archive.log
