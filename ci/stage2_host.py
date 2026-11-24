@@ -21,6 +21,10 @@ WINE_PATCH = RECIPES / "patches/stray-va-stage2.patch"
 WINE_SHA = "3f6b3470af0c4ed2580846b7182a23b8f9aa1aa51e81bb5d15465f16d2ac4909"
 PREVIOUS_SOURCE = "d6bebc808fe225c94d4215c0f4d6d431d55bde4d9f3cdd6f335906f6ce8a731c"
 PATCHED_SOURCE = "62806f6b0fed7ea8f8c04efe2279e74279ff78bff146313a2d7350dbcecd0b1a"
+PRESSURE_PATCH = RECIPES / "patches/stray-va-pressure.patch"
+PRESSURE_SHA = "16fad4faa009abc330e4174c26b5414d82e33f3140e2c2603f870eabf44dcb85"
+PRESSURE_SOURCE = "7bbe4d71e6fe5e9944aa6449cd1e9a8b58c69c0ecef4de5fe4be944fe9ca8149"
+PRESSURE_MARKER = b"early_tries=%llu early_hits=%llu"
 ARCHIVE = "app/Madeira/libntdll_unix.a"
 REPORT = native.ROOT / "stage2-member.json"
 STAGE2_MARKER = b"second_tries=%llu second_hits=%llu second_skips=%llu"
@@ -164,6 +168,9 @@ def wine():
     subprocess.run([sys.executable, TESTS / "test-patch.py", native.BCD], check=True)
     patch(WINE_PATCH, ["build/ntdll-unix/virtual_ios.c"])
     native.verify(SOURCE, PATCHED_SOURCE)
+    native.verify(PRESSURE_PATCH, PRESSURE_SHA)
+    patch(PRESSURE_PATCH, ["build/ntdll-unix/virtual_ios.c"])
+    native.verify(SOURCE, PRESSURE_SOURCE)
     contents = SOURCE.read_text(encoding="utf-8")
     check(contents.count((TESTS / "stage2.h").read_text(encoding="utf-8").strip()) == 1,
           "Stage2 policy tests differ from production")
@@ -184,11 +191,12 @@ def wine():
                             source, "-o", test], check=True)
             subprocess.run([test], check=True)
         header_steps()
-        native.verify(SOURCE, PATCHED_SOURCE)
+        native.verify(SOURCE, PRESSURE_SOURCE)
         member = compile_one()
-        check(STAGE2_MARKER in member.read_bytes(), "Missing stage2 Wine telemetry")
+        check(all(m in member.read_bytes() for m in (STAGE2_MARKER, PRESSURE_MARKER)), "Missing Wine cursor telemetry")
         report = replace_member(temp, member)
-        REPORT.write_text(json.dumps(dict(report, stage2_patch_sha256=WINE_SHA, stage2_source_sha256=PATCHED_SOURCE), indent=2))
+        REPORT.write_text(json.dumps(dict(report, stage2_patch_sha256=WINE_SHA, stage2_source_sha256=PATCHED_SOURCE,
+                                          pressure_patch_sha256=PRESSURE_SHA, pressure_source_sha256=PRESSURE_SOURCE), indent=2))
 
 
 def link():
@@ -201,7 +209,7 @@ def link():
     duo.relink(True, before_link=apply_app_changes)
     out = native.ROOT / "out"
     host = (out / "Madeira").read_bytes()
-    check(STAGE2_MARKER in host and CONTROLLER_MARKER in host
+    check(all(m in host for m in (STAGE2_MARKER, PRESSURE_MARKER, CONTROLLER_MARKER))
           and all(marker.encode() in host for marker in changes["markers"]),
           "Native mapper, controller or diagnostic selector missing")
     manifest = out / "build.json"

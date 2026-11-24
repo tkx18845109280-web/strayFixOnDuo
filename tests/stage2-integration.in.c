@@ -12,7 +12,8 @@ static struct ios_af_rec { int stage; } ios_af;
 static unsigned int ios_va_scan_tries, ios_va_scan_below_floor, ios_va_scan_above_ceiling, ios_va_scan_skips;
 static unsigned int full_calls, bounded_calls, bounded_steps[2], full_steps;
 static uintptr_t full_result;
-static uint64_t clock_ns;
+static uint64_t clock_ns, model_full_ns;
+static int wine_owns_views;
 static struct stray_va_cursor ios_stray_va_cursor;
 static uint64_t stray_va_now(void) { return ++clock_ns; }
 
@@ -24,7 +25,7 @@ static void *model_map(uintptr_t lo, uintptr_t hi, uintptr_t size, uintptr_t mas
         ++*steps;
         while (i < size && !memory[a+i]) ++i;
         if (i == size) return (void *)a;
-        ++ios_va_scan_tries;
+        if (!wine_owns_views) ++ios_va_scan_tries;
         errno = EEXIST;
         ios_af.stage = 41;
     }
@@ -41,7 +42,7 @@ static void *map_free_area(void *lo, void *hi, uintptr_t size, int top, int prot
 {
     assert(!top && prot == 3 && (uintptr_t)lo == TEST_LO && (uintptr_t)hi == TEST_HI);
     assert(errno == EDOM && ios_af.stage == 9);
-    ++full_calls;
+    clock_ns += model_full_ns; ++full_calls;
     full_result = (uintptr_t)model_map((uintptr_t)lo, (uintptr_t)hi, size, mask, &full_steps);
     return (void *)full_result;
 }
@@ -67,9 +68,62 @@ static uintptr_t allocate(uintptr_t owner, uintptr_t guest, uintptr_t host_size,
 
 static void seed(uintptr_t owner, uintptr_t guest, uintptr_t next)
 {
-    ios_stray_va_cursor = (struct stray_va_cursor){owner,guest,TEST_LO,TEST_HI,next,64};
+    ios_stray_va_cursor = (struct stray_va_cursor){owner,guest,TEST_LO,TEST_HI,next,64,0};
 }
 
+
+static void test_pressure(void)
+{
+    struct stray_va_stats report = {0}, *s = stray_va_stats_for(231,110);
+    struct stray_va_pressure p = {0};
+    for (int i=0; i<63; i++) assert(!stray_va_pressure_result(&p,8,1024,1000,0,0));
+    assert(!stray_va_pressure_result(&p,8,1024,1000000000,0,0)); /* one OS deschedule */
+    for (int i=0; i<63; i++) assert(!stray_va_pressure_result(&p,8,1024,70000,0,0));
+    assert(stray_va_pressure_result(&p,8,1024,70000,0,0));
+    assert(!stray_va_pressure_result(&p,12,1024,70000,0,0)); /* new window */
+    assert(!p.slow && p.samples==1 && !p.failures);
+    memset(memory,0,sizeof(memory));
+    wine_owns_views=1;
+    model_full_ns=67000; /* simulate repeatedly expensive full searches */
+    unsigned full=0, tries=0, total_steps=0, exact_steps=0, baseline_steps=0;
+    for (unsigned i=0; i<915; i++)
+    {
+        uintptr_t pos=allocate(231,110,1,1,&report);
+        assert(pos==TEST_LO+i); /* free placement matches the unmodified mapper in this layout */
+        memory[pos]=1;
+        full+=full_calls; tries+=bounded_calls;
+        total_steps+=full_steps; exact_steps+=bounded_steps[0]; baseline_steps+=i+1;
+        assert(!bounded_steps[1] && bounded_steps[0]<=1);
+    }
+    assert(full==114 && tries==801 && tries==s->early_hits && s->early_hits==s->early_tries);
+    assert(s->second_tries==0 && s->expensive==0);
+    printf("Ascending Wine views, 915 allocations: full=%u of 915, exact_hits=%u, inspected=%u vs. %u model starts.\n",
+           full,tries,total_steps+exact_steps,baseline_steps);
+    memset(memory,1,sizeof(memory)); memory[TEST_LO]=0;
+    uint64_t before=s->early_tries;
+    unsigned extra=0;
+    for (unsigned i=0;i<4096;i++)
+    {
+        assert(allocate(231,110,1,1,&report)==TEST_LO && full_calls==1 && full_steps==1);
+        assert(bounded_steps[0]<=1 && !bounded_steps[1]);
+        extra+=bounded_steps[0];
+    }
+    assert(extra <= 72 && s->early_tries-before==extra);
+    printf("Persistent occupied next slot, 4096 allocations: %u added failed exact starts; all fell back correctly.\n",extra);
+    model_full_ns=999;
+    for (int i=0;i<128;i++) assert(allocate(231,110,1,1,&report)==TEST_LO);
+    assert(!s->pressure.slow);
+    before=s->early_tries;
+    for (int i=0;i<1024;i++) assert(allocate(231,110,1,1,&report)==TEST_LO && !bounded_calls);
+    assert(s->early_tries==before);
+    struct stray_va_cursor old=ios_stray_va_cursor;
+    for (int i=0;i<128;i++) { model_full_ns=68000; assert(allocate(231,110,1,0,&report)==TEST_LO); }
+    assert(!memcmp(&old,&ios_stray_va_cursor,sizeof(old)));
+    /* Fallback retains its result/error even when neither path finds space. */
+    memset(memory,1,sizeof(memory)); seed(231,110,68); ios_stray_va_cursor.exact_only=1;
+    assert(!allocate(231,110,1,1,&report) && full_calls==1 && bounded_steps[0]==1 && !bounded_steps[1]);
+    wine_owns_views=0; model_full_ns=0;
+}
 int main(void)
 {
     struct stray_va_stats snapshot = {0}, *a = stray_va_stats_for(17,5), *b = stray_va_stats_for(81,6);
@@ -132,5 +186,6 @@ int main(void)
     uintptr_t hi=60;
     assert(stray_va_second_admit(&policy,16,1024,20,1,1,&hi));
     assert(!policy.skip && !policy.misses && policy.width==32 && hi==52);
+    test_pressure();
     puts("Actual production selection, original fallback error/counters, owner/window isolation, retry, range, and success handling passed.");
 }

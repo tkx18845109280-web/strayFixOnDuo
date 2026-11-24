@@ -1,0 +1,145 @@
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -25055,12 +25055,53 @@
+     else p->width = 240;
+ }
+ 
++/* Under virtual_mutex. Timestamp data is already collected by the original mapper.
++ * Only repeated full-search cost may open an exact-next-address trial. Cap each
++ * contribution so a single descheduling pause cannot enable it. */
++struct stray_va_pressure
++{
++    uintptr_t lo, hi;
++    uint64_t block_ns;
++    unsigned int samples, slow, failures, skip;
++};
++
++static int stray_va_pressure_result( struct stray_va_pressure *p, uintptr_t lo, uintptr_t hi,
++                                     uint64_t full_ns, int early, int hit )
++{
++    if (p->lo != lo || p->hi != hi)
++        *p = (struct stray_va_pressure){ .lo = lo, .hi = hi };
++    if (early)
++    {
++        if (hit) p->failures = p->skip = 0;
++        else
++        {
++            if (p->failures < 5) p->failures++;
++            p->skip = (2u << p->failures) - 1;
++        }
++    }
++    if (hit) return 0;
++    p->block_ns += full_ns < 128000 ? full_ns : 128000;
++    if (++p->samples == 64)
++    {
++        p->slow = p->block_ns >= 64 * 32000;
++        p->samples = p->block_ns = 0;
++    }
++    if (p->skip)
++    {
++        p->skip--;
++        return 0;
++    }
++    return p->slow;
++}
++
+ struct stray_va_stats
+ {
+     uintptr_t peb, pid;
+     uint64_t full, expensive, hits, misses, full_ns, hint_ns;
+     uint64_t second_tries, second_hits, second_skips, second_ns;
+     struct stray_va_second_policy second_policy;
++    struct stray_va_pressure pressure;
++    uint64_t early_tries, early_hits;
+ };
+ 
+ static struct stray_va_stats *stray_va_stats_for( uintptr_t peb, uintptr_t pid )
+@@ -25103,7 +25144,7 @@
+ struct stray_va_cursor
+ {
+     uintptr_t peb, pid, lo, hi, next;
+-    unsigned int remaining;
++    unsigned int remaining, exact_only;
+ };
+ 
+ static int stray_va_hint(const struct stray_va_cursor *c, uintptr_t peb, uintptr_t pid,
+@@ -25126,16 +25167,18 @@
+ 
+ static void stray_va_result(struct stray_va_cursor *c, uintptr_t peb, uintptr_t pid,
+                             uintptr_t lo, uintptr_t hi, uintptr_t placed, uintptr_t size,
+-                            int used_hint, unsigned int original_rejects)
+-{
++                            int used_hint, unsigned int original_rejects, int allow_early)
++{
++    int early = used_hint ? c->exact_only : original_rejects < 64;
+     if (placed < lo || placed >= hi || !size || size > hi - placed ||
+-        (!used_hint && original_rejects < 64))
++        (!used_hint && early && !allow_early))
+     {
+         c->remaining = 0;
+         return;
+     }
+     *c = (struct stray_va_cursor){peb, pid, lo, hi, placed + size,
+-                                 used_hint ? c->remaining - 1 : 64};
++                                 /* Refresh the low-address preference after at most 16 early successes. */
++                                 used_hint ? c->remaining - 1 : (early ? 16 : 64), early};
+ }
+ 
+ /* Measurement cannot displace the mmap error consulted by the allocation path. */
+@@ -25150,12 +25193,13 @@
+ static void stray_va_log( const struct stray_va_stats *s )
+ {
+     int saved = errno;
+-    dprintf( 2, "[stray-va] pid=%llu full=%llu expensive=%llu hint_hit=%llu hint_miss=%llu full_us=%llu hint_us=%llu second_tries=%llu second_hits=%llu second_skips=%llu second_us=%llu\n",
++    dprintf( 2, "[stray-va] pid=%llu full=%llu expensive=%llu hint_hit=%llu hint_miss=%llu full_us=%llu hint_us=%llu second_tries=%llu second_hits=%llu second_skips=%llu second_us=%llu early_tries=%llu early_hits=%llu\n",
+              (unsigned long long)s->pid, (unsigned long long)s->full, (unsigned long long)s->expensive,
+              (unsigned long long)s->hits, (unsigned long long)s->misses,
+              (unsigned long long)(s->full_ns / 1000), (unsigned long long)(s->hint_ns / 1000),
+              (unsigned long long)s->second_tries, (unsigned long long)s->second_hits,
+-             (unsigned long long)s->second_skips, (unsigned long long)(s->second_ns / 1000) );
++             (unsigned long long)s->second_skips, (unsigned long long)(s->second_ns / 1000),
++             (unsigned long long)s->early_tries, (unsigned long long)s->early_hits );
+     errno = saved;
+ }
+ 
+@@ -25458,7 +25502,7 @@
+                 {
+                     uintptr_t first, last, pid = (uintptr_t)teb->ClientId.UniqueProcess;
+                     uint64_t t0, hint_ns = 0, full_ns = 0, second_ns = 0;
+-                    int second = 0;
++                    int second = 0, early = 0, allow_early;
+                     struct stray_va_stats *stats = stray_va_stats_for( (uintptr_t)peb, pid );
+                     unsigned int real_rejects = 0;
+                     int hinted = 0, hit = 0;
+@@ -25468,11 +25512,13 @@
+                     {
+                         struct ios_af_rec prior_attribution = ios_af;
+                         int prior_errno = errno;
++                        early = proposed_cursor.exact_only;
++                        if (early) last = first + host_size; /* range already checked by stray_va_hint */
+                         hinted = 1;
+                         t0 = stray_va_now();
+                         ptr = map_free_area_inner( (void *)first, (void *)last, host_size, 0, unix_prot, align_mask, 1 );
+                         hint_ns = stray_va_now() - t0;
+-                        if (!ptr && stray_va_second_hint( first, (uintptr_t)end, host_size, align_mask, &first, &last ))
++                        if (!ptr && !early && stray_va_second_hint( first, (uintptr_t)end, host_size, align_mask, &first, &last ))
+                         {
+                             if (stray_va_second_admit( &stats->second_policy, (uintptr_t)start, (uintptr_t)end,
+                                                       first, host_size, align_mask + 1, &last ))
+@@ -25507,11 +25553,15 @@
+                         real_rejects = ios_va_scan_tries - tries0 - (ios_va_scan_below_floor - below0) -
+                                        (ios_va_scan_above_ceiling - above0);
+                     }
++                    allow_early = stray_va_pressure_result( &stats->pressure, (uintptr_t)start, (uintptr_t)end,
++                                                            full_ns, early, hit );
++                    stats->early_tries += early;
++                    stats->early_hits += early && hit;
+                     stray_va_account( stray_report, stats, hinted, hit, real_rejects, hint_ns, full_ns, second, second_ns );
+                     if (ptr)
+                     {
+                         stray_va_result( &proposed_cursor, (uintptr_t)peb, pid, (uintptr_t)start, (uintptr_t)end,
+-                                         (uintptr_t)ptr, host_size, hit, real_rejects );
++                                         (uintptr_t)ptr, host_size, hit, real_rejects, allow_early );
+                         publish_cursor = 1;
+                     }
+                 }
