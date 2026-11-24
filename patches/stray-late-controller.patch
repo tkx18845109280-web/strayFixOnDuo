@@ -1,0 +1,49 @@
+--- a/app/Madeira/GamepadInput.swift
++++ b/app/Madeira/GamepadInput.swift
+@@ -50,6 +50,10 @@
+     /// so player 1 then shows as connected for the whole session even while no
+     /// controller is in use. That is why it is opt-in: without the switch,
+     /// slot 0 connects only when a real source appears, as before.
++    static func reservesLatePhysicalPad(gameEarly: Bool, gameLate: Bool, mode: String, keys: Bool) -> Bool {
++        gameEarly && gameLate && mode == "xinput" && !keys
++    }
++
+     @MainActor func reserveSessionSlot(touchControls: Bool) {
+         // Round 630 (agent T1 S1; Dokimon Quest N9PJHQ, DQKXK3: the game loads xinput1_3 and looks for pads once at start, the touch pad
+         // connected 0-5 s later): the switch is also read from the game's own file, so a list row can set it for one game, as
+@@ -58,6 +62,17 @@
+         guard Self.enabled, gameSet || Self.optIn("MADEIRA_PAD_EARLY_SLOT") else { return }
+         let touch = touchControls && Self.touchEnabled
+         let paired = !GCController.controllers().isEmpty
++        let latePhysical = Self.reservesLatePhysicalPad(gameEarly: gameSet,
++            gameLate: MadeiraConfig.gameValue("env.MADEIRA_PAD_LATE_CONNECT") == "1",
++            mode: Self.configuredPadMode().value, keys: LibraryModel.shared.controllerMode == "keys")
++        if latePhysical {
++            // The game can enumerate before Bluetooth delivers the connection. Publish neutral
++            // player 1 before returning to the caller that starts Wine. Real samples use the
++            // same slot. This reservation does not enable touch controls or change their player.
++            queue.sync { [self] in latePhysicalPlayerOne = true; sample() }
++            LogStore.shared.log("[xinput] slot=0 ready before launch for late physical attachment (game)")
++            return
++        }
+         guard touch || paired else {
+             LogStore.shared.log("[xinput] ml1990 early-slot switch set (\(gameSet ? "game" : "cfg")), slot=0 not reserved: no touch controller "
+                                 + "mappings shown and no paired controller at the session start")
+@@ -232,6 +247,7 @@
+     private var hidBattery: (level: UInt8, charging: UInt8) = (UInt8(WINIOS_HIDPAD_BATTERY_UNKNOWN), 0)
+     private var hidBatteryCountdown = 0
+     private var touchState = TouchGamepadState()
++    private var latePhysicalPlayerOne = false   // Owned by queue; one Wine session per app launch.
+     @MainActor private var observers: [NSObjectProtocol] = []
+     @MainActor private var started = false
+     /// madeira-bcd (from Madeira #517, 58c8990 "ml2190"): every 2 s a controller whose extendedGamepad is no longer the
+@@ -420,7 +436,8 @@
+                 PadKeyboardMouse.shared.releaseAll("controller disconnected")
+             }
+             let hid = i == 0 && hidActive
+-            guard pad != nil || touchConnected || gyroConnected || aimConnected else {
++            let reservedPhysical = i == 0 && latePhysicalPlayerOne && !hid && keyboardMouse == nil
++            guard pad != nil || touchConnected || gyroConnected || aimConnected || reservedPhysical else {
+                 winios_gamepad_set_state(Int32(i), nil)
+                 if hid { winios_hidpad_set_state(nil) }
+                 continue

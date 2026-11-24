@@ -1,0 +1,53 @@
+name: Relink Stray host for the full Duo display
+on:
+  workflow_dispatch:
+    inputs:
+      controller_patch:
+        description: "Apply the checked-in Stray controller source patch"
+        default: false
+        required: false
+        type: boolean
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: duo-host-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  link:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: recipes
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: thebcd69/bcd-games
+          ref: f811dd05a9183cda20ffd3956cb1958cafe654f7
+          path: publisher
+          persist-credentials: false
+      - name: Select the official iOS 27.2 SDK when installed
+        run: python3 recipes/ci/duo_relink.py select
+      - name: Stage verified BCD sources
+        run: python3 recipes/ci/native_host.py prepare
+      - name: Fetch the three proven component archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 recipes/ci/duo_relink.py inputs
+      - name: Relink app and verify native platform, SDK and Stray fix
+        env:
+          STRAY_CONTROLLER_PATCH: ${{ inputs.controller_patch }}
+        run: python3 recipes/ci/duo_relink.py link
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BCD-v712-Stray-Duo-host
+          path: |
+            out/Madeira
+            out/build.json
+          if-no-files-found: error
+          retention-days: 5
+      - name: Show Xcode error detail
+        if: failure()
+        run: test ! -f bcd/archive.log || tail -n 45 bcd/archive.log
