@@ -1,0 +1,63 @@
+--- a/app/Madeira/WineProcessBridge.m
++++ b/app/Madeira/WineProcessBridge.m
+@@ -1880,6 +1880,7 @@
+ 
+ static void *wine_process_thread(void *arg) {
+     @autoreleasepool {
++        BOOL useStrayD3D11 = NO;
+         /* Perf: the guest main thread runs ON this pthread. Promote to
+          * USER_INTERACTIVE so it schedules on P-cores with minimal kernel
+          * timer coalescing (same rationale as start_thread in
+@@ -2376,6 +2377,7 @@
+                         continue;
+                     }
+                     setenv(k.UTF8String, v.UTF8String, 1);
++                    if ([k isEqualToString:@"DXMT_STRAY_D11_PERF"]) useStrayD3D11 = [v isEqualToString:@"1"];
+                     LOG("game config env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
+                     fprintf(stderr, "[madeira-env] game %s=%s\n", k.UTF8String, v.UTF8String);
+                 }
+@@ -2849,11 +2851,17 @@
+              * sysx64 in any session, system32 too in an ARM64EC one. The MADEIRA_DXGI_SRC and MADEIRA_D3D11_SRC lines below link the same two
+              * files again (nothing changes under this key), and DXMT's opt-in 64-bit Direct3D 9 (the block below) loads this winemetal.dll too. Only the
+              * value "1" counts. */
++            /* Only the current game's own profile can select the alternate renderer. */
++            const char *d3d11Source = "d3d11-src.dll";
++            if (useStrayD3D11 && [fm fileExistsAtPath:[bundlePath stringByAppendingPathComponent:@"arm64ec-windows/d3d11-stray-perf.dll"]]) {
++                d3d11Source = "d3d11-stray-perf.dll";
++                dprintf(STDERR_FILENO, "[stray-d3d11] selected per-title renderer for this launch\n");
++            }
+             {
+                 const char *dxmtFresh = getenv("MADEIRA_DXMT_FRESH");
+                 if (dxmtFresh && strcmp(dxmtFresh, "1") == 0) {
+-                    static const char *const freshSet[][2] = {
+-                        { "d3d11.dll", "d3d11-src.dll" }, { "dxgi.dll", "dxgi-src.dll" },
++                    const char *const freshSet[][2] = {
++                        { "d3d11.dll", d3d11Source }, { "dxgi.dll", "dxgi-src.dll" },
+                         { "d3d10core.dll", "d3d10core-src.dll" }, { "winemetal.dll", "winemetal-src.dll" },
+                     };
+                     NSString *ecDir = [bundlePath stringByAppendingPathComponent:@"arm64ec-windows"];
+@@ -2948,7 +2956,7 @@
+                 }
+                 if ((d3d11Src && d3d11Src[0] == '1') || halfBC) {
+                     NSString *ecDir = [bundlePath stringByAppendingPathComponent:@"arm64ec-windows"];
+-                    NSString *srcDll = [ecDir stringByAppendingPathComponent:@"d3d11-src.dll"];
++                    NSString *srcDll = [ecDir stringByAppendingPathComponent:@(d3d11Source)];
+                     if ([fm fileExistsAtPath:srcDll]) {
+                         NSMutableArray *dirs = [NSMutableArray arrayWithObject:
+                             [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"]];
+@@ -2959,11 +2967,11 @@
+                             [fm createSymbolicLinkAtPath:dst withDestinationPath:srcDll error:nil];
+                         }
+                         if (halfBC)
+-                            dprintf(STDERR_FILENO, "[WineProc] MADEIRA_MIP_CLAMP_AUTO=2 on a GPU without BC sampling: d3d11.dll -> d3d11-src.dll (DXMT source build with BCD's Direct3D 11 patches; %s)\n",
+-                                    use_arm64ec ? "system32 + sysx64" : "sysx64 only");
++                            dprintf(STDERR_FILENO, "[WineProc] MADEIRA_MIP_CLAMP_AUTO=2 on a GPU without BC sampling: d3d11.dll -> %s (DXMT source build with BCD's Direct3D 11 patches; %s)\n",
++                                    d3d11Source, use_arm64ec ? "system32 + sysx64" : "sysx64 only");
+                         else
+-                            dprintf(STDERR_FILENO, "[WineProc] MADEIRA_D3D11_SRC=1: d3d11.dll -> d3d11-src.dll (DXMT source build with BCD's Direct3D 11 patches; %s)\n",
+-                                    use_arm64ec ? "system32 + sysx64" : "sysx64 only");
++                            dprintf(STDERR_FILENO, "[WineProc] MADEIRA_D3D11_SRC=1: d3d11.dll -> %s (DXMT source build with BCD's Direct3D 11 patches; %s)\n",
++                                    d3d11Source, use_arm64ec ? "system32 + sysx64" : "sysx64 only");
+                     } else if (halfBC) {
+                         dprintf(STDERR_FILENO, "[WineProc] MADEIRA_MIP_CLAMP_AUTO=2 but this build has no d3d11-src.dll -- the committed d3d11.dll is kept (it reads 2 as 1)\n");
+                     } else {

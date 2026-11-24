@@ -1,0 +1,180 @@
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -24994,31 +24994,97 @@
+ 
+ /* Updated with virtual_mutex held. A bounded table keeps the counters of simultaneous
+  * Stray guest instances separate. New instances replace old entries after eight distinct keys. */
++/* Called only after stray_va_hint supplied first and that probe missed.
++ * Both ranges bound aligned candidate starts, with end exclusive for memory. */
++static int stray_va_second_hint(uintptr_t first, uintptr_t hi, uintptr_t size,
++                                uintptr_t mask, uintptr_t *next, uintptr_t *end)
++{
++    uintptr_t step, last_start, room_steps, second, extra_steps;
++    if (!size || first >= hi || size > hi - first || mask == UINTPTR_MAX ||
++        (mask & (mask + 1)) || (first & mask))
++        return 0;
++    step = mask + 1;
++    last_start = hi - size;
++    room_steps = (last_start - first) / step;
++    if (room_steps < 16) return 0;
++    second = first + 16 * step;
++    extra_steps = room_steps - 16;
++    if (extra_steps > 239) extra_steps = 239;
++    *next = second;
++    *end = second + extra_steps * step + size;
++    return 1;
++}
++
++struct stray_va_second_policy
++{
++    uintptr_t lo, hi;
++    unsigned int width, misses, skip;
++};
++
++/* Count only eligible first-window misses. Normal first-window hits and
++ * near-ceiling requests incur no backoff cost and do not reset the policy. */
++static int stray_va_second_admit(struct stray_va_second_policy *p, uintptr_t lo, uintptr_t hi,
++                                 uintptr_t first, uintptr_t size, uintptr_t step, uintptr_t *end)
++{
++    uintptr_t starts;
++    if (p->lo != lo || p->hi != hi)
++        *p = (struct stray_va_second_policy){ .lo = lo, .hi = hi, .width = 32 };
++    if (p->skip)
++    {
++        --p->skip;
++        return 0;
++    }
++    starts = (*end - first - size) / step + 1;
++    if (starts > p->width) *end = first + (p->width - 1) * step + size;
++    return 1;
++}
++
++static void stray_va_second_result(struct stray_va_second_policy *p, uintptr_t placed,
++                                   uintptr_t first, uintptr_t step)
++{
++    if (placed)
++    {
++        uintptr_t n = (placed - first) / step + 1;
++        p->width = n <= 32 ? 32 : n <= 64 ? 64 : n <= 128 ? 128 : 240;
++        p->misses = p->skip = 0;
++        return;
++    }
++    if (p->misses < 4) ++p->misses;
++    p->skip = (1u << (p->misses + 2)) - 1; /* 7, 15, 31, then 63 eligible misses. */
++    if (p->width < 128) p->width *= 2;
++    else p->width = 240;
++}
++
+ struct stray_va_stats
+ {
+     uintptr_t peb, pid;
+     uint64_t full, expensive, hits, misses, full_ns, hint_ns;
++    uint64_t second_tries, second_hits, second_skips, second_ns;
++    struct stray_va_second_policy second_policy;
+ };
+ 
+-static void stray_va_account( struct stray_va_stats *report, uintptr_t peb, uintptr_t pid,
+-                              int hinted, int hit, unsigned int full_rejects,
+-                              uint64_t hint_ns, uint64_t full_ns )
++static struct stray_va_stats *stray_va_stats_for( uintptr_t peb, uintptr_t pid )
+ {
+     static struct stray_va_stats slots[8];
+     static unsigned int next;
+-    struct stray_va_stats *s;
++    unsigned int i;
++    for (i = 0; i < 8; ++i)
++        if (slots[i].peb == peb && slots[i].pid == pid) return &slots[i];
++    i = next++ % 8;
++    slots[i] = (struct stray_va_stats){ .peb = peb, .pid = pid };
++    return &slots[i];
++}
++
++static void stray_va_account( struct stray_va_stats *report, struct stray_va_stats *s,
++                              int hinted, int hit, unsigned int full_rejects,
++                              uint64_t hint_ns, uint64_t full_ns, int second, uint64_t second_ns )
++{
+     uint64_t requests;
+-    unsigned int i;
+     int expensive = !hit && full_rejects >= 64;
+-
+-    for (i = 0; i < 8; ++i)
+-        if (slots[i].peb == peb && slots[i].pid == pid) break;
+-    if (i == 8)
+-    {
+-        i = next++ % 8;
+-        slots[i] = (struct stray_va_stats){ .peb = peb, .pid = pid };
+-    }
+-    s = &slots[i];
++    s->second_tries += second == 1;
++    s->second_hits += second == 1 && hit;
++    s->second_skips += second == -1;
++    s->second_ns += second_ns;
+     s->full += !hit;
+     s->expensive += expensive;
+     s->hits += hit;
+@@ -25026,7 +25092,8 @@
+     s->full_ns += full_ns;
+     s->hint_ns += hint_ns;
+     requests = s->full + s->hits;
+-    if (requests == 1 || (expensive && s->expensive == 1) ||
++    if ((second == 1 && (s->second_tries == 1 || (hit && s->second_hits == 1))) ||
++        requests == 1 || (expensive && s->expensive == 1) ||
+         (requests >= 128 && !(requests & (requests - 1))))
+         *report = *s;
+ }
+@@ -25083,10 +25150,12 @@
+ static void stray_va_log( const struct stray_va_stats *s )
+ {
+     int saved = errno;
+-    dprintf( 2, "[stray-va] pid=%llu full=%llu expensive=%llu hint_hit=%llu hint_miss=%llu full_us=%llu hint_us=%llu\n",
++    dprintf( 2, "[stray-va] pid=%llu full=%llu expensive=%llu hint_hit=%llu hint_miss=%llu full_us=%llu hint_us=%llu second_tries=%llu second_hits=%llu second_skips=%llu second_us=%llu\n",
+              (unsigned long long)s->pid, (unsigned long long)s->full, (unsigned long long)s->expensive,
+              (unsigned long long)s->hits, (unsigned long long)s->misses,
+-             (unsigned long long)(s->full_ns / 1000), (unsigned long long)(s->hint_ns / 1000) );
++             (unsigned long long)(s->full_ns / 1000), (unsigned long long)(s->hint_ns / 1000),
++             (unsigned long long)s->second_tries, (unsigned long long)s->second_hits,
++             (unsigned long long)s->second_skips, (unsigned long long)(s->second_ns / 1000) );
+     errno = saved;
+ }
+ 
+@@ -25388,7 +25457,9 @@
+                                                 "stray-win64-shipping.exe" ))
+                 {
+                     uintptr_t first, last, pid = (uintptr_t)teb->ClientId.UniqueProcess;
+-                    uint64_t t0, hint_ns = 0, full_ns = 0;
++                    uint64_t t0, hint_ns = 0, full_ns = 0, second_ns = 0;
++                    int second = 0;
++                    struct stray_va_stats *stats = stray_va_stats_for( (uintptr_t)peb, pid );
+                     unsigned int real_rejects = 0;
+                     int hinted = 0, hit = 0;
+                     proposed_cursor = ios_stray_va_cursor;
+@@ -25401,6 +25472,20 @@
+                         t0 = stray_va_now();
+                         ptr = map_free_area_inner( (void *)first, (void *)last, host_size, 0, unix_prot, align_mask, 1 );
+                         hint_ns = stray_va_now() - t0;
++                        if (!ptr && stray_va_second_hint( first, (uintptr_t)end, host_size, align_mask, &first, &last ))
++                        {
++                            if (stray_va_second_admit( &stats->second_policy, (uintptr_t)start, (uintptr_t)end,
++                                                      first, host_size, align_mask + 1, &last ))
++                            {
++                                second = 1;
++                                t0 = stray_va_now();
++                                ptr = map_free_area_inner( (void *)first, (void *)last, host_size, 0, unix_prot, align_mask, 1 );
++                                second_ns = stray_va_now() - t0;
++                                hint_ns += second_ns;
++                                stray_va_second_result( &stats->second_policy, (uintptr_t)ptr, first, align_mask + 1 );
++                            }
++                            else second = -1;
++                        }
+                         hit = (ptr != NULL);
+                         if (!hit)
+                         {
+@@ -25422,7 +25507,7 @@
+                         real_rejects = ios_va_scan_tries - tries0 - (ios_va_scan_below_floor - below0) -
+                                        (ios_va_scan_above_ceiling - above0);
+                     }
+-                    stray_va_account( stray_report, (uintptr_t)peb, pid, hinted, hit, real_rejects, hint_ns, full_ns );
++                    stray_va_account( stray_report, stats, hinted, hit, real_rejects, hint_ns, full_ns, second, second_ns );
+                     if (ptr)
+                     {
+                         stray_va_result( &proposed_cursor, (uintptr_t)peb, pid, (uintptr_t)start, (uintptr_t)end,

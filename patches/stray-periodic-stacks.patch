@@ -1,0 +1,46 @@
+diff --git a/app/Madeira/Winios/Winios.m b/app/Madeira/Winios/Winios.m
+--- a/app/Madeira/Winios/Winios.m
++++ b/app/Madeira/Winios/Winios.m
+@@ -38,6 +38,7 @@
+ /* The window census struct is shared with Swift through this header;
+  * including it here keeps both sides' definitions the same. */
+ #include "Winios.h"
++#include "../../../build/madeira_cfg.h"
+ #include "VulkanLayerGeometry.h"   /* madeira-bcd (Windows Vulkan) */
+ #include "WiniosCursor.h"
+ #include "winios_windowed.h"
+@@ -1642,9 +1643,22 @@
+     });
+ }
+ 
++/* Snapshot the current game's setting once. The timer survives a Wine session. */
++static _Atomic int winios_periodic_stacks_enabled = 1;
++
++static void winios_configure_periodic_stacks(void) {
++    char value[16];
++    int enabled = !(madeira_cfg_get("periodic-thread-stacks", value, sizeof(value)) &&
++                    !strcmp(value, "0"));
++    atomic_store_explicit(&winios_periodic_stacks_enabled, enabled, memory_order_relaxed);
++    if (!enabled)
++        fprintf(stderr, "[winios] periodic thread stacks off for this session\n");
++}
++
+ /* Called at every Wine session start (WineProcessBridge): a game session
+  * starts with no overlay windows and no known Metal windows. */
+ void winios_session_reset(void) {
++    winios_configure_periodic_stacks();
+     winios_swapchain_hwnds_reset();   /* [swap-win]: HWND values of the last session mean nothing now */
+     dispatch_async(dispatch_get_main_queue(), ^{
+         [g_game_metal removeAllObjects];
+@@ -1741,7 +1755,10 @@
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+         dispatch_source_set_timer(stack_timer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),
+                                   20 * NSEC_PER_SEC, NSEC_PER_SEC);
+-        dispatch_source_set_event_handler(stack_timer, ^{ ios_dump_all_thread_stacks(); });
++        dispatch_source_set_event_handler(stack_timer, ^{
++            if (!atomic_load_explicit(&winios_periodic_stacks_enabled, memory_order_relaxed)) return;
++            ios_dump_all_thread_stacks();
++        });
+         dispatch_resume(stack_timer);
+     }
+ }

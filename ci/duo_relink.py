@@ -81,7 +81,7 @@ def select_xcode():
     print("Selected",selected,"device SDK",options[selected][-1])
 
 
-def relink(controller):
+def relink(controller, before_link=None):
     version_used = version(subprocess.check_output(["xcrun","--sdk","iphoneos","--show-sdk-version"],text=True))
     if version_used < (27,1):
         raise RuntimeError("The selected iOS SDK cannot use the whole Duo display")
@@ -99,6 +99,8 @@ def relink(controller):
             subprocess.run(["git","-c","core.autocrlf=false","apply",*flags,str(patch)],
                            cwd=native.BCD,check=True)
         patch_digest = native.sha(patch)
+    if before_link is not None:
+        before_link()
     native.link()
     out = native.ROOT/"out"
     built = native.mach(out/"Madeira")
