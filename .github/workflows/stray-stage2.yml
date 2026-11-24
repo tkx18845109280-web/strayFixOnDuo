@@ -32,8 +32,8 @@ jobs:
           python3 recipes/ci/duo_relink.py inputs
       - name: Compile the Wine translation unit and verify the archive
         run: |
-          brew list --versions bison >/dev/null || brew install bison
-          export PATH="$(brew --prefix bison)/bin:$PATH"
+          brew install bison llvm lld
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
           python3 recipes/ci/stage2_host.py wine
       - name: Verify the title-specific diagnostics change and relink
         run: python3 recipes/ci/stage2_host.py link
@@ -48,6 +48,6 @@ jobs:
       - if: failure()
         name: Show compiler and configuration diagnostics
         run: |
-          for f in bcd/build/ntdll-unix/obj/virtual.err bcd/archive.log bcd/wine-native-configure.log bcd/make-include.log; do
+          for f in bcd/build/ntdll-unix/obj/virtual.err bcd/archive.log bcd/wine-native-configure.log bcd/wine-configure.log bcd/make-include.log; do
             if test -f "$f"; then tail -n 25 "$f"; fi
           done
