@@ -1,0 +1,233 @@
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -15455,6 +15455,19 @@
+  * falls back to the plain step, which keeps a wrong answer here free of consequence.
+  * Forward progress is guaranteed in both directions: bottom-up resumes past the region
+  * end (> addr, since the region contains addr), top-down at region base - size (< addr). */
++struct stray_region_history
++{
++    uintptr_t lo, hi;
++    size_t alignment, last_size;
++    unsigned int cooldown;
++};
++
++struct stray_region_scan
++{
++    unsigned int initial_skips;
++    int used_region;
++};
++
+ static int ios_skip_occupied( void *addr, size_t size, size_t align_mask,
+                               int top_down, void **out )
+ {
+@@ -15467,6 +15480,8 @@
+     if (mach_vm_region( mach_task_self(), &rbase, &rsize, VM_REGION_BASIC_INFO_64,
+                         (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+         return 0;
++    /* A successful region query may transfer a send right for object_name. */
++    if (MACH_PORT_VALID( obj )) mach_port_deallocate( mach_task_self(), obj );
+     if (rbase > a || !rsize)
+         return 0;         /* addr is in a free hole: mmap failed for some other reason
+                              (iOS refuses certain addresses), so stepping is correct */
+@@ -15628,7 +15643,7 @@
+ }
+ 
+ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
+-                                void *start, size_t size, int unix_prot )
++                                void *start, size_t size, int unix_prot, struct stray_region_scan *scan )
+ {
+     int ceiling_declined = 0;   /* madeira-bcd: a region lies above the ceiling in this scan's way: no second ask */
+ 
+@@ -15766,6 +15781,27 @@
+             else start = (void *)(uintptr_t)((ios_layerkit_hi + (size_t)step - 1) & ~((uintptr_t)step - 1));
+             continue;
+         }
++        /* For this bottom-up scan only, once the observed regions have already
++         * caused eight collisions, query the next candidate before submitting a
++         * fixed mapping. An occupied start rules out every aligned start up to
++         * that region's end. No positive or negative answer survives this step. */
++        if (scan && step > 0 && ios_va_scan_skips - scan->initial_skips >= 8)
++        {
++            void *next = start;
++            if (ios_skip_occupied( start, size, (size_t)step - 1, 0, &next ) &&
++                (uintptr_t)next > (uintptr_t)start)
++            {
++                /* Count the rejected address for the original pressure policy,
++                 * just as the existing below-floor/above-ceiling paths do. */
++                ios_va_scan_tries++;
++                ios_va_scan_skips++;
++                scan->used_region = 1;
++                if ((uintptr_t)next >= (uintptr_t)end ||
++                    size > (uintptr_t)end - (uintptr_t)next) break;
++                start = next;
++                continue;
++            }
++        }
+         if (anon_mmap_tryfixed( start, size, unix_prot, 0 ) != MAP_FAILED) return start;
+         TRACE( "Found free area is already mapped, start %p.\n", start );
+         ios_va_scan_tries++;
+@@ -15815,11 +15851,46 @@
+  * Find a free area between views inside the specified range and map it.
+  * virtual_mutex must be held by caller.
+  */
+-static void *map_free_area_inner( void *base, void *end, size_t size, int top_down, int unix_prot, size_t align_mask, int bounded_hint );
+-static void *map_free_area( void *base, void *end, size_t size, int top_down, int unix_prot, size_t align_mask )
++static void *map_free_area_inner( void *base, void *end, size_t size, int top_down, int unix_prot, size_t align_mask, int bounded_hint, struct stray_region_scan *scan );
++static void *map_free_area( void *base, void *end, size_t size, int top_down, int unix_prot, size_t align_mask, struct stray_region_history *history )
+ {
+     unsigned long before = ios_layerkit_skips;
+-    void *r = map_free_area_inner( base, end, size, top_down, unix_prot, align_mask, 0 );
++    struct stray_region_scan scan = { ios_va_scan_skips, 0 };
++    unsigned int tries0 = ios_va_scan_tries, below0 = ios_va_scan_below_floor, above0 = ios_va_scan_above_ceiling;
++    int query_occupied = 0;
++    /* A cold, full or changing window gets the original scan. A recent success
++     * is only a policy hint: it never establishes that an address is still free. */
++    if (history)
++    {
++        if (history->lo != (uintptr_t)base || history->hi != (uintptr_t)end || history->alignment != align_mask)
++            *history = (struct stray_region_history){ .lo = (uintptr_t)base, .hi = (uintptr_t)end, .alignment = align_mask };
++        query_occupied = !history->cooldown && history->last_size >= size;
++        if (history->cooldown) history->cooldown--;
++    }
++    /* anon_mmap_tryfixed can release a reserved executable window. Keep the
++     * original search throughout any range that could contain such a claim. */
++    int outside_exe_window = ios_exe_win_state >= 0 &&
++        (!ios_exe_win_base || (uintptr_t)end <= ios_exe_win_base ||
++         ((uintptr_t)base >= ios_exe_win_base &&
++          (uintptr_t)base - ios_exe_win_base >= ios_exe_win_size));
++    void *r = map_free_area_inner( base, end, size, top_down, unix_prot, align_mask, 0,
++                                   query_occupied && outside_exe_window &&
++                                   (!ios_layerkit_enforce || !ios_layerkit_lo || (uintptr_t)end <= ios_layerkit_lo ||
++                                    (uintptr_t)base >= ios_layerkit_hi) ? &scan : NULL );
++    /* Another Mach client may have released memory while we searched. Give
++     * every original candidate a fresh fixed-mapping attempt before failure or
++     * before relaxing an exclusion. */
++    if (!r && scan.used_region)
++    {
++        /* The caller uses these mutex-protected logical rejects to classify a
++         * single placement. Only its final, authoritative scan feeds that policy. */
++        ios_va_scan_tries = tries0;
++        ios_va_scan_skips = scan.initial_skips;
++        ios_va_scan_below_floor = below0;
++        ios_va_scan_above_ceiling = above0;
++        history->cooldown = 32;
++        r = map_free_area_inner( base, end, size, top_down, unix_prot, align_mask, 0, NULL );
++    }
+     if (!r && ios_layerkit_enforce && ios_layerkit_skips != before)
+     {
+         /* ml901: the only fit was inside CoreAnimation's range. Failing the
+@@ -15828,11 +15899,12 @@
+         ios_layerkit_enforce = 0;
+         dprintf( 2, "[layerkit-range] ml901 exclusion DROPPED: no free area of 0x%lx outside 0x%llx..0x%llx; "
+                     "guest views may now enter CoreAnimation's range\n", (unsigned long)size, ios_layerkit_lo, ios_layerkit_hi );
+-        r = map_free_area_inner( base, end, size, top_down, unix_prot, align_mask, 0 );
+-    }
++        r = map_free_area_inner( base, end, size, top_down, unix_prot, align_mask, 0, NULL );
++    }
++    if (history) history->last_size = r ? size : 0;
+     return r;
+ }
+-static void *map_free_area_inner( void *base, void *end, size_t size, int top_down, int unix_prot, size_t align_mask, int bounded_hint )
++static void *map_free_area_inner( void *base, void *end, size_t size, int top_down, int unix_prot, size_t align_mask, int bounded_hint, struct stray_region_scan *scan )
+ {
+     struct wine_rb_entry *first = find_view_inside_range( &base, &end, top_down );
+     ptrdiff_t step = top_down ? -(align_mask + 1) : (align_mask + 1);
+@@ -15878,7 +15950,7 @@
+             if ((char *)start + size > gap_lo && (size_t)((char *)start + size - gap_lo) > ios_scan_maxgap)
+                 ios_scan_maxgap = (char *)start + size - gap_lo;
+             if ((start = try_map_free_area( gap_lo, (char *)start + size, step,
+-                                            start, size, unix_prot ))) break;
++                                            start, size, unix_prot, scan ))) break;
+             start = ROUND_ADDR( (char *)view->base - size, align_mask );
+             /* stop if remaining space is not large enough */
+             if (!start || start >= end || start < base) { ios_scan_stop = 4; return NULL; }
+@@ -15898,7 +15970,7 @@
+             if ((char *)view->base > (char *)start && (size_t)((char *)view->base - (char *)start) > ios_scan_maxgap)
+                 ios_scan_maxgap = (char *)view->base - (char *)start;
+             if ((start = try_map_free_area( start, bounded_hint ? min( end, view->base ) : view->base, step,
+-                                            start, size, unix_prot ))) break;
++                                            start, size, unix_prot, scan ))) break;
+             start = ROUND_ADDR( (char *)view->base + view->size + align_mask, align_mask );
+             /* stop if remaining space is not large enough */
+             if (!start || start >= end || (char *)end - (char *)start < size) { ios_scan_stop = 2; return NULL; }
+@@ -15913,7 +15985,7 @@
+         if (start && (char *)end > (char *)start)
+             ios_scan_tailgap = (char *)end - (char *)start;
+         if (ios_scan_tailgap > ios_scan_maxgap) ios_scan_maxgap = ios_scan_tailgap;
+-        start = try_map_free_area( base, end, step, start, size, unix_prot );
++        start = try_map_free_area( base, end, step, start, size, unix_prot, scan );
+     }
+ 
+     if (!bounded_hint && !start)
+@@ -25096,6 +25168,7 @@
+ 
+ struct stray_va_stats
+ {
++    struct stray_region_history region_history;
+     uintptr_t peb, pid;
+     uint64_t full, expensive, hits, misses, full_ns, hint_ns;
+     uint64_t second_tries, second_hits, second_skips, second_ns;
+@@ -25516,7 +25589,7 @@
+                         if (early) last = first + host_size; /* range already checked by stray_va_hint */
+                         hinted = 1;
+                         t0 = stray_va_now();
+-                        ptr = map_free_area_inner( (void *)first, (void *)last, host_size, 0, unix_prot, align_mask, 1 );
++                        ptr = map_free_area_inner( (void *)first, (void *)last, host_size, 0, unix_prot, align_mask, 1, NULL );
+                         hint_ns = stray_va_now() - t0;
+                         if (!ptr && !early && stray_va_second_hint( first, (uintptr_t)end, host_size, align_mask, &first, &last ))
+                         {
+@@ -25525,7 +25598,7 @@
+                             {
+                                 second = 1;
+                                 t0 = stray_va_now();
+-                                ptr = map_free_area_inner( (void *)first, (void *)last, host_size, 0, unix_prot, align_mask, 1 );
++                                ptr = map_free_area_inner( (void *)first, (void *)last, host_size, 0, unix_prot, align_mask, 1, NULL );
+                                 second_ns = stray_va_now() - t0;
+                                 hint_ns += second_ns;
+                                 stray_va_second_result( &stats->second_policy, (uintptr_t)ptr, first, align_mask + 1 );
+@@ -25548,7 +25621,7 @@
+                     if (!hit)
+                     {
+                         t0 = stray_va_now();
+-                        ptr = map_free_area( start, end, host_size, 0, unix_prot, align_mask );
++                        ptr = map_free_area( start, end, host_size, 0, unix_prot, align_mask, &stats->region_history );
+                         full_ns = stray_va_now() - t0;
+                         real_rejects = ios_va_scan_tries - tries0 - (ios_va_scan_below_floor - below0) -
+                                        (ios_va_scan_above_ceiling - above0);
+@@ -25565,11 +25638,11 @@
+                         publish_cursor = 1;
+                     }
+                 }
+-                else ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask );
++                else ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask, NULL );
+             }
+             else
+ #endif
+-                ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask );
++                ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask, NULL );
+ #ifdef WINE_IOS
+             /* the holdback is now a reserved area: place the view there */
+             if (!ptr && ios_cage_release_on_exhaustion( start, end, view_size ))
+@@ -25679,11 +25752,11 @@
+                     (size_t)((char *)wow_hi_end - (char *)hs) >= 0x40000000ULL + view_size)
+                     hs = (char *)hs + 0x40000000ULL;
+                 ptr = map_reserved_area( hs, wow_hi_end, host_size, top_down, unix_prot, align_mask );
+-                if (!ptr) ptr = map_free_area( hs, wow_hi_end, host_size, top_down, unix_prot, align_mask );
++                if (!ptr) ptr = map_free_area( hs, wow_hi_end, host_size, top_down, unix_prot, align_mask, NULL );
+                 if (!ptr && hs != wow_hi_start)
+                 {
+                     ptr = map_reserved_area( wow_hi_start, wow_hi_end, host_size, top_down, unix_prot, align_mask );
+-                    if (!ptr) ptr = map_free_area( wow_hi_start, wow_hi_end, host_size, top_down, unix_prot, align_mask );
++                    if (!ptr) ptr = map_free_area( wow_hi_start, wow_hi_end, host_size, top_down, unix_prot, align_mask, NULL );
+                 }
+                 if (++hi_n <= 16 || !(hi_n % 256))
+                     dprintf( 2, "[wow-window] #%lu band below the 32-bit windows full: 0x%lx bytes %s above them in %p..%p%s\n",
+@@ -30440,7 +30513,7 @@
+ 
+     if (!zone || !limit_high) return STATUS_NOT_SUPPORTED;
+     if (owner) ios_hook_zone_owner_died( (void *)owner );   /* a zone left by an earlier process with this PEB */
+-    if (!(ptr = map_free_area( start, end, image + zone, 1, PROT_NONE, granularity_mask )))
++    if (!(ptr = map_free_area( start, end, image + zone, 1, PROT_NONE, granularity_mask, NULL )))
+     {
+         if (log_n++ < 16)
+             dprintf( 2, "[hook-zone] madeira-bcd: no room for ntdll (0x%lx) plus %lu MB in %p..%p; ntdll is placed as "

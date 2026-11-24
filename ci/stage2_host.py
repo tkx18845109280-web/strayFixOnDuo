@@ -24,6 +24,9 @@ PATCHED_SOURCE = "62806f6b0fed7ea8f8c04efe2279e74279ff78bff146313a2d7350dbcecd0b
 PRESSURE_PATCH = RECIPES / "patches/stray-va-pressure.patch"
 PRESSURE_SHA = "16fad4faa009abc330e4174c26b5414d82e33f3140e2c2603f870eabf44dcb85"
 PRESSURE_SOURCE = "7bbe4d71e6fe5e9944aa6449cd1e9a8b58c69c0ecef4de5fe4be944fe9ca8149"
+REGION_PATCH = RECIPES / "patches/stray-va-live-region.patch"
+REGION_SHA = "365e76fa0fe6fc16a9fef850e11d06f49ef215b6b551e93d4ba32f7b4ce34658"
+REGION_SOURCE = "61d10b196bbaae68c1fc85d5e8e7672ec715bae0afb57d13497f127a68b7f113"
 PRESSURE_MARKER = b"early_tries=%llu early_hits=%llu"
 ARCHIVE = "app/Madeira/libntdll_unix.a"
 REPORT = native.ROOT / "stage2-member.json"
@@ -192,11 +195,18 @@ def wine():
             subprocess.run([test], check=True)
         header_steps()
         native.verify(SOURCE, PRESSURE_SOURCE)
+        baseline = temp / "before-region.c"
+        shutil.copyfile(SOURCE, baseline)
+        native.verify(REGION_PATCH, REGION_SHA)
+        patch(REGION_PATCH, ["build/ntdll-unix/virtual_ios.c"])
+        native.verify(SOURCE, REGION_SOURCE)
+        subprocess.run([sys.executable, TESTS / "test-live-region.py", baseline, SOURCE], check=True)
         member = compile_one()
         check(all(m in member.read_bytes() for m in (STAGE2_MARKER, PRESSURE_MARKER)), "Missing Wine cursor telemetry")
         report = replace_member(temp, member)
         REPORT.write_text(json.dumps(dict(report, stage2_patch_sha256=WINE_SHA, stage2_source_sha256=PATCHED_SOURCE,
-                                          pressure_patch_sha256=PRESSURE_SHA, pressure_source_sha256=PRESSURE_SOURCE), indent=2))
+                                          pressure_patch_sha256=PRESSURE_SHA, pressure_source_sha256=PRESSURE_SOURCE,
+                                          region_patch_sha256=REGION_SHA, region_source_sha256=REGION_SOURCE), indent=2))
 
 
 def link():
