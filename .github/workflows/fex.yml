@@ -1,0 +1,34 @@
+name: Build FEX iOS static libraries
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: bcd-v712-fex-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fex:
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Restore the FEX libraries used by the app
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bcd/FEX/build-ios
+          key: bcd-v712-fex-static-arm64-ios17-v1
+      - name: Build pinned FEX and collect public header dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-fex.sh build
+      - name: Verify device objects and cached files
+        run: bash scripts/build-fex.sh verify
+      - name: Save verified FEX libraries and headers
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: bcd/FEX/build-ios
+          key: bcd-v712-fex-static-arm64-ios17-v1
