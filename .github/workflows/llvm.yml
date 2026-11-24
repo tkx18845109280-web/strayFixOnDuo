@@ -1,0 +1,34 @@
+name: Warm LLVM 15 iOS archive cache
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: llvm15-ios17-warmup-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  llvm:
+    runs-on: macos-15
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Restore finished LLVM libraries and headers
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .stray-cache/llvm-15-ios17-arm64
+          key: bcd-v712-llvm15-8dfdcc7b-ios17-arm64-macos15-v1
+      - name: Cross-build LLVM static libraries and package DXMT headers
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-llvm.sh build
+      - name: Verify LLVM cache contents
+        run: bash scripts/build-llvm.sh verify
+      - name: Save finished libraries immediately
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .stray-cache/llvm-15-ios17-arm64
+          key: bcd-v712-llvm15-8dfdcc7b-ios17-arm64-macos15-v1
